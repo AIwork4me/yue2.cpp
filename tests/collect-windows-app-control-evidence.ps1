@@ -39,7 +39,7 @@ try {
         Id = $ids
     } -MaxEvents 5000 -ErrorAction Stop)
 } catch {
-    throw "Unable to read $logName: $($_.Exception.Message). No security policy changed."
+    throw "Unable to read ${logName}: $($_.Exception.Message). No security policy changed."
 }
 
 $targetIds = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
