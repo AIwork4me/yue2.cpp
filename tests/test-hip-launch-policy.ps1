@@ -6,10 +6,10 @@ $ErrorActionPreference = 'Stop'
 function Assert-Blocked($test, $session, $expected) {
     $actual = Get-HipExternalLaunchBlock -Session $session
     if ($expected -and [string]::IsNullOrWhiteSpace($actual)) {
-        throw "$test: expected external execution block; got none"
+        throw "${test}: expected external execution block; got none"
     }
     if (-not $expected -and -not [string]::IsNullOrWhiteSpace($actual)) {
-        throw "$test: incorrectly classified real loader/engine failure as policy block: $actual"
+        throw "${test}: incorrectly classified real loader/engine failure as policy block: $actual"
     }
     Write-Host "[PASS] $test"
 }
