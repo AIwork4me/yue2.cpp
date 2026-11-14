@@ -36,10 +36,10 @@ Assert-Blocked 'ordinary failed startup is not policy block' (Session $false $tr
 # without installing ROCm or launching a real process.
 $harness = Get-Content -Raw (Join-Path $PSScriptRoot 'test-hip-windows.ps1')
 foreach ($required in @(
-    "if ($mainPrerequisiteStatus -ne 'PASS')",
-    "Get-HipExternalLaunchBlock -Session $neg",
-    "Get-HipExternalLaunchBlock -Session $wrongDevice",
-    "intact engine prerequisite is"
+    'if ($mainPrerequisiteStatus -ne',
+    'Get-HipExternalLaunchBlock -Session $neg',
+    'Get-HipExternalLaunchBlock -Session $wrongDevice',
+    'intact engine prerequisite is'
 )) {
     if (-not $harness.Contains($required)) { throw "Harness prerequisite/block guard missing: $required" }
 }
