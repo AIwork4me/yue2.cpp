@@ -61,6 +61,8 @@ param(
     [int] $JobTimeoutSec = 900
 )
 
+. (Join-Path $PSScriptRoot 'hip-launch-policy.ps1')
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 foreach ($p in @($EngineRoot, $ModelPath, $VaePath)) {
@@ -93,7 +95,7 @@ if ($TestConfig -and (Test-Path $TestConfig)) {
 
 $script:Results = New-Object System.Collections.Generic.List[object]
 $script:Failures = 0
-function Record([string] $Check, [string] $Status, $Detail = '') {
+function Record([string] $Check, [ValidateSet('PASS', 'FAIL', 'BLOCKED', 'NOT RUN')][string] $Status, $Detail = '') {
     $script:Results.Add([pscustomobject]@{
         timestamp = (Get-Date).ToUniversalTime().ToString('o')
         check     = $Check
@@ -351,18 +353,24 @@ Record 'provenance/engine-version' 'PASS' "$version"
 
 # ================================================================ 1. main session
 $main = $null
+# Negative tests are meaningful only after the intact bundle starts.
+# A Windows application-control denial invalidates all negative outcomes.
+$mainPrerequisiteStatus = 'NOT RUN'
 try {
     $main = Start-Engine -Root $EngineRoot -Name 'main' -PortNumber $Port
-    if ($main.Process.HasExited -and -not $main.Healthy) {
+    $mainBlock = Get-HipExternalLaunchBlock -Session $main
+    if ($mainBlock) {
+        $mainPrerequisiteStatus = 'BLOCKED'
+        Record 'engine/start' 'BLOCKED' $mainBlock
+    } elseif ($main.Process.HasExited -and -not $main.Healthy) {
+        $mainPrerequisiteStatus = 'FAIL'
         $exitLine = (($main.Log -split "`n") | Select-Object -Last 5) -join ' | '
-        if ($main.Process.ExitCode -eq 126 -or $main.Log -match 'blocked|Smart App|应用程序控制|策略阻止|Device Guard') {
-            Record 'engine/start' 'BLOCKED' "Smart App Control blocked the unsigned binary (exit $($main.Process.ExitCode)). Re-run after SAC reputation changes or use a signed build."
-        } else {
-            Record 'engine/start' 'FAIL' "yue-server exited during startup (code $($main.Process.ExitCode)): $exitLine"
-        }
+        Record 'engine/start' 'FAIL' "yue-server exited during startup (code $($main.Process.ExitCode)): $exitLine"
     } elseif (-not $main.Healthy) {
+        $mainPrerequisiteStatus = 'FAIL'
         Record 'engine/start' 'FAIL' "no healthy /health answer within $StartupTimeoutSec s"
     } else {
+        $mainPrerequisiteStatus = 'PASS'
         Record 'engine/start' 'PASS' "healthy on port $Port with no SDK environment variables"
         # gcnArch straight from the HIP device properties the engine logs
         if ($main.Log -match 'Device 0:\s*(?<g>[^,]+),\s*(?<arch>gfx\d+)') {
@@ -458,12 +466,21 @@ try {
 
 # ================================ 5. negative: broken bundles must fail closed
 # Isolated copies only - the bundle under test is never touched.
-foreach ($case in @(
-        @{ Name = 'no-ggml-hip';     RemoveFile = 'ggml-hip.dll' },
-        @{ Name = 'no-amd-comgr';    RemoveFile = 'amd_comgr.dll' },
-        @{ Name = 'no-hip-runtime';  RemovePattern = 'amdhip64*.dll' },
-        @{ Name = 'no-kernel-pack';  RemoveDir = 'rocblas'; ExpectJobFailure = $true }
-    )) {
+$negativeCases = @(
+    @{ Name = 'no-ggml-hip';     RemoveFile = 'ggml-hip.dll' },
+    @{ Name = 'no-amd-comgr';    RemoveFile = 'amd_comgr.dll' },
+    @{ Name = 'no-hip-runtime';  RemovePattern = 'amdhip64*.dll' },
+    @{ Name = 'no-kernel-pack';  RemoveDir = 'rocblas'; ExpectJobFailure = $true }
+)
+if ($mainPrerequisiteStatus -ne 'PASS') {
+    # Do not run isolated negative cases when the intact engine cannot start:
+    # external policy blocks would give five meaningless false-positive PASSes.
+    $deferredStatus = if ($mainPrerequisiteStatus -eq 'BLOCKED') { 'BLOCKED' } else { 'NOT RUN' }
+    foreach ($case in $negativeCases) {
+        Record "negative/$($case.Name)" $deferredStatus "intact engine prerequisite is $mainPrerequisiteStatus; missing-dependency behavior untested"
+    }
+} else {
+foreach ($case in $negativeCases) {
     $iso = Join-Path $OutputDir ("iso-" + $case.Name)
     if (Test-Path $iso) { Remove-Item $iso -Recurse -Force }
     Copy-Item $EngineRoot $iso -Recurse
@@ -473,14 +490,22 @@ foreach ($case in @(
     $neg = $null
     try {
         $neg = Start-Engine -Root $iso -Name $case.Name -PortNumber ($Port + 1)
-        if ($case.ExpectJobFailure) {
+        $negativePolicyBlock = Get-HipExternalLaunchBlock -Session $neg
+        if ($negativePolicyBlock) {
+            Record "negative/$($case.Name)" 'BLOCKED' $negativePolicyBlock
+        } elseif ($case.ExpectJobFailure) {
             # Kernel libraries load lazily: startup alone cannot catch a
             # broken kernel pack. The contract is that a submitted job fails
             # loudly (or takes the engine down) naming the missing library
             # and the gfx target - never a done job or a CPU-side result.
             if (-not $neg.Healthy) {
                 $last = (($neg.Log -split "`n") | Where-Object { $_ -match 'FATAL|error|ROCm|backend|hip|LoadLibrary|HIP' } | Select-Object -Last 2) -join ' | '
-                Record "negative/$($case.Name)" 'PASS' "engine refused to start: $last"
+                $kernelError = $neg.Log -match '(?i)rocBLAS error|Cannot read.*TensileLibrary|hipblas.*error|missing.*kernel|kernel.*not found'
+                if ($neg.Process.HasExited -and $kernelError) {
+                    Record "negative/$($case.Name)" 'PASS' "startup failed with a kernel-library error: $last"
+                } else {
+                    Record "negative/$($case.Name)" 'FAIL' "kernel-pack removal did not produce a specific kernel failure: $last"
+                }
             } else {
                 $short = @{} + $defaultRequest
                 $short['duration'] = 10.0
@@ -504,7 +529,11 @@ foreach ($case in @(
             Record "negative/$($case.Name)" 'FAIL' "engine still became healthy without $($case.RemoveFile)$($case.RemovePattern)$($case.RemoveDir) (would risk silent fallback)"
         } elseif ($neg.Process.HasExited) {
             $last = (($neg.Log -split "`n") | Where-Object { $_ -match 'FATAL|error|ROCm|backend|hip|LoadLibrary|HIP' } | Select-Object -Last 2) -join ' | '
-            Record "negative/$($case.Name)" 'PASS' "exit $($neg.Process.ExitCode): $last"
+            if ([string]::IsNullOrWhiteSpace($last)) {
+                Record "negative/$($case.Name)" 'FAIL' "exit $($neg.Process.ExitCode) without a diagnostic proving backend refusal"
+            } else {
+                Record "negative/$($case.Name)" 'PASS' "exit $($neg.Process.ExitCode): $last"
+            }
         } else {
             Record "negative/$($case.Name)" 'FAIL' "engine neither exited nor answered; killed"
         }
@@ -515,23 +544,36 @@ foreach ($case in @(
         Remove-Item $iso -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+} # End intact-engine prerequisite guard for broken-bundle negative cases.
 
 # ============================ 6. negative: unknown device id must not redirect
 $wrongDevice = $null
-try {
-    $wrongDevice = Start-Engine -Root $EngineRoot -Name 'wrong-device' -PortNumber ($Port + 2) -Device 'ROCm9'
-    if ($wrongDevice.Healthy) {
-        Record 'negative/wrong-device-id' 'FAIL' 'engine became healthy on --device ROCm9: an unknown device must fail, not start on another one'
-    } elseif ($wrongDevice.Process.HasExited) {
-        $last = (($wrongDevice.Log -split "`n") | Where-Object { $_ -match 'FATAL|error|device|ROCm|backend' } | Select-Object -Last 2) -join ' | '
-        Record 'negative/wrong-device-id' 'PASS' "exit $($wrongDevice.Process.ExitCode): $last"
-    } else {
-        Record 'negative/wrong-device-id' 'FAIL' 'engine neither exited nor answered; killed'
+if ($mainPrerequisiteStatus -ne 'PASS') {
+    $deferredStatus = if ($mainPrerequisiteStatus -eq 'BLOCKED') { 'BLOCKED' } else { 'NOT RUN' }
+    Record 'negative/wrong-device-id' $deferredStatus "intact engine prerequisite is $mainPrerequisiteStatus; unknown-device rejection untested"
+} else {
+    try {
+        $wrongDevice = Start-Engine -Root $EngineRoot -Name 'wrong-device' -PortNumber ($Port + 2) -Device 'ROCm9'
+        $negativePolicyBlock = Get-HipExternalLaunchBlock -Session $wrongDevice
+        if ($negativePolicyBlock) {
+            Record 'negative/wrong-device-id' 'BLOCKED' $negativePolicyBlock
+        } elseif ($wrongDevice.Healthy) {
+            Record 'negative/wrong-device-id' 'FAIL' 'engine became healthy on --device ROCm9: an unknown device must fail, not start on another one'
+        } elseif ($wrongDevice.Process.HasExited) {
+            $last = (($wrongDevice.Log -split "`n") | Where-Object { $_ -match 'FATAL|error|device|ROCm|backend' } | Select-Object -Last 2) -join ' | '
+            if ($last -match '(?i)ROCm9|unknown.*device|device.*not found|invalid.*device|requested.*device') {
+                Record 'negative/wrong-device-id' 'PASS' "exit $($wrongDevice.Process.ExitCode): $last"
+            } else {
+                Record 'negative/wrong-device-id' 'FAIL' "wrong-device rejection not demonstrated: exit $($wrongDevice.Process.ExitCode), $last"
+            }
+        } else {
+            Record 'negative/wrong-device-id' 'FAIL' 'engine neither exited nor answered; killed'
+        }
+    } catch {
+        Record 'negative/wrong-device-id' 'FAIL' $_.Exception.Message
+    } finally {
+        Stop-Engine $wrongDevice
     }
-} catch {
-    Record 'negative/wrong-device-id' 'FAIL' $_.Exception.Message
-} finally {
-    Stop-Engine $wrongDevice
 }
 
 # ====================================================== 7. portable env (no SDK)
