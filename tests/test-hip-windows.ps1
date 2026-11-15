@@ -349,7 +349,16 @@ foreach ($dll in @('ggml-hip.dll', 'amdhip64_7.dll', 'amd_comgr.dll', 'rocm_kpac
 }
 # cmd wraps the call: PS 5.1 turns native stderr into terminating errors here
 $version = (cmd /d /c "`"$exe`" --help 2>&1" | Select-Object -First 1)
-Record 'provenance/engine-version' 'PASS' "$version"
+$helpExitCode = $LASTEXITCODE
+if ($helpExitCode -eq 4551) {
+    Record 'provenance/engine-version' 'BLOCKED' "CLI --help denied by Windows execution policy (exit $helpExitCode); this is not a version PASS"
+} elseif ([string]::IsNullOrWhiteSpace([string]$version)) {
+    Record 'provenance/engine-version' 'NOT RUN' "CLI --help yielded no version/help text (exit $helpExitCode)"
+} elseif ([string]$version -match '(?i)blocked|access is denied|application control|code integrity') {
+    Record 'provenance/engine-version' 'BLOCKED' "CLI --help reported an execution-policy restriction: $version"
+} else {
+    Record 'provenance/engine-version' 'PASS' "$version (exit $helpExitCode)"
+}
 
 # ================================================================ 1. main session
 $main = $null
@@ -581,7 +590,7 @@ $noSdk = $true
 foreach ($v in @('HIP_PATH', 'ROCM_PATH')) {
     if ([Environment]::GetEnvironmentVariable($v)) { $noSdk = $false }
 }
-Record 'portable/no-sdk-env' $(if ($noSdk) { 'PASS' } else { 'FAIL' }) 'SDK variables were absent while the engine ran app-locally'
+Record 'portable/no-sdk-env' $(if ($noSdk) { 'PASS' } else { 'FAIL' }) 'SDK environment variables cleared; successful runtime without an SDK requires engine/start PASS'
 
 # =================================================================== 8. outputs
 $Results | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $OutputDir 'results.json') -Encoding UTF8
