@@ -19,13 +19,40 @@ $dir = [System.IO.Path]::GetFullPath($OutputDirectory)
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
 
 $ciTool = Get-Command 'citool.exe' -ErrorAction SilentlyContinue
+$policyLines = New-Object System.Collections.Generic.List[string]
 if ($ciTool) {
     $policyText = (& $ciTool.Source -lp 2>&1 | Out-String)
-    $policyText | Set-Content -LiteralPath (Join-Path $dir 'active-policy-list.txt') -Encoding UTF8
+    $policyLines.Add($policyText)
+    if ($policyText -match '0x80070005|denied|拒绝') {
+        $policyLines.Add('CiTool.exe -lp was denied (needs elevation); read-only fallback inventory follows.')
+    }
 } else {
-    'CiTool.exe unavailable; collect active policy list manually with citool.exe -lp.' |
-        Set-Content -LiteralPath (Join-Path $dir 'active-policy-list.txt') -Encoding UTF8
+    $policyLines.Add('CiTool.exe unavailable on PATH; read-only fallback inventory follows.')
 }
+# Read-only fallback inventory (works without elevation) so the report never
+# depends solely on citool: active policy binaries, policy-load events, SAC state.
+try {
+    $policyLines.Add('')
+    $policyLines.Add('== Active policy binaries (CiPolicies\Active, read-only listing) ==')
+    Get-ChildItem -LiteralPath "$env:SystemRoot\System32\CodeIntegrity\CiPolicies\Active" -ErrorAction Stop |
+        ForEach-Object { $policyLines.Add(('{0}  {1} bytes  {2}' -f $_.Name, $_.Length, $_.LastWriteTime.ToString('o'))) }
+} catch { $policyLines.Add('CiPolicies\Active listing failed: ' + $_.Exception.Message) }
+try {
+    $policyLines.Add('')
+    $policyLines.Add('== Policy-load events 3099/3096 last 7 days (empty = no WDAC policy loads logged) ==')
+    $pl = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-CodeIntegrity/Operational'; Id = @(3099, 3096); StartTime = (Get-Date).AddDays(-7) } -MaxEvents 50 -ErrorAction SilentlyContinue)
+    foreach ($e in $pl) {
+        $pairs = ([regex]::Matches($e.ToXml(), "<Data Name='([^']+)'>([^<]*)</Data>") | ForEach-Object { '{0}={1}' -f $_.Groups[1].Value, $_.Groups[2].Value }) -join ' | '
+        $policyLines.Add(('{0} id={1} {2}' -f $e.TimeCreated.ToUniversalTime().ToString('o'), $e.Id, $pairs))
+    }
+    if (-not $pl) { $policyLines.Add('(no 3099/3096 events in window)') }
+} catch { $policyLines.Add('3099/3096 query failed: ' + $_.Exception.Message) }
+$policyLines | Set-Content -LiteralPath (Join-Path $dir 'active-policy-list.txt') -Encoding UTF8
+
+# Smart App Control feature state (read-only registry value; 0=off 1=evaluation 2=on).
+$sacState = try { (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy' -ErrorAction Stop).VerifiedAndReputablePolicyState } catch { 'unreadable: ' + $_.Exception.Message }
+('VerifiedAndReputablePolicyState = {0} (0=off, 1=evaluation, 2=on)' -f $sacState) |
+    Set-Content -LiteralPath (Join-Path $dir 'sac-state.txt') -Encoding UTF8
 
 $logName = 'Microsoft-Windows-CodeIntegrity/Operational'
 # 3076 = audit would-block; 3077 = enforcement block; 3089 = signer
@@ -76,6 +103,7 @@ $records = @($events | Sort-Object TimeCreated | ForEach-Object {
                 3077 { 'ENFORCED_BLOCK' }
                 3033 { 'SIGNING_OR_CIG_ERROR_REQUIRES_CORRELATION' }
                 3089 { 'SIGNER_DETAILS_CORRELATED' }
+                3099 { 'POLICY_LOADED' }
                 default { 'CONTEXT' }
             }
             local_xml_file = [IO.Path]::GetFileName($file)
