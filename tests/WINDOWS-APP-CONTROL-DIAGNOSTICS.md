@@ -5,6 +5,29 @@ dependency/provenance checks, but its executable was blocked before GPU
 inference. Older df4b193 bundle has 33 physical PASSes. Source parity and
 successful Windows build do not turn a newly blocked binary into physical PASS.
 
+## Confirmed findings from the Windows gfx1100 host (2026-11-15)
+
+The earlier "SAC Evaluation mode" label was incorrect: Microsoft defines
+`VerifiedAndReputablePolicyState=1` as **On / Enforce**, and `2` as Evaluation.
+The observed 219 Code Integrity **3077** enforced blocks (zero 3076) in
+the collected 24-hour window all name `VerifiedAndReputableDesktop`,
+PolicyID `27555.1000.240208`, GUID
+`{0283AC0F-FFF1-49AE-ADA1-8A933130CAD6}` and status `0xC0E90002`.
+The matching GUID was observed as an installed `.cip` policy; elevated
+`citool.exe -lp` was not performed after the owner declined UAC, so
+there is no claim of a complete live policy inventory. The unsigned
+`yue-server.exe` and GGML DLLs were affected; no AMD-signed ROCm DLL was
+observed among the blocked files.
+
+These observations establish the **test-host execution blocker** without
+establishing that CA signing will be guaranteed to pass. OV and EV both
+have to establish SmartScreen reputation; EV no longer gives automatic
+first-download SmartScreen bypass.
+
+Sources:
+- https://learn.microsoft.com/en-us/windows/apps/develop/smart-app-control/test-your-app-with-smart-app-control
+- https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation
+
 ## Events and root-cause evidence
 
 Windows Code Integrity event IDs are distinct:
@@ -16,9 +39,10 @@ Windows Code Integrity event IDs are distinct:
   App Control; evaluate with correlated events, not by itself.
 - 3099 = policy load and activation information.
 
-A Smart App Control Evaluation label alone does NOT prove that SAC
-Evaluation blocked the executable. Match the enforcing PolicyId of an
-actual 3077 to the active policy name and enforcement state from CiTool.
+A SAC label alone is insufficient: evaluate the exact policy ID, the
+3077 enforcement event and the persisted registry state. On this host,
+the event policy matches the on-disk SAC Enforce `.cip`. A complete policy
+listing via elevated CiTool was not available and is not claimed.
 
 Official Microsoft references:
 
